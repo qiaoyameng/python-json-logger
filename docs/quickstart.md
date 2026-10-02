@@ -143,6 +143,58 @@ formatter = JsonFormatter(
 )
 ```
 
+### Field conflicts
+
+The same output field can be supplied by defaults, required fields, static fields, a
+dict log message, `extra`, or the timestamp. Renaming is always resolved from the
+original field name, so collisions that only appear after renaming are handled together
+rather than being overwritten in separate steps.
+
+Set `field_conflict_strategy` to select the global behaviour:
+
+- `FieldConflictStrategy.OVERRIDE`: use the historical precedence
+  `defaults`, `required_fields`, `static_fields`, `message`, `extra`, `timestamp`.
+  This is the default.
+- `FieldConflictStrategy.PRIORITY`: select a value using a complete `source_priority`.
+- `FieldConflictStrategy.KEEP_ALL`: retain every value as a plain JSON array.
+- `FieldConflictStrategy.ERROR`: raise `FieldConflictError`.
+
+```python
+from pythonjsonlogger.core import FieldConflictStrategy, FieldSource
+
+formatter = JsonFormatter(
+    field_conflict_strategy=FieldConflictStrategy.PRIORITY,
+    source_priority=(
+        FieldSource.DEFAULTS,
+        FieldSource.STATIC_FIELDS,
+        FieldSource.MESSAGE,
+        FieldSource.EXTRA,
+        FieldSource.REQUIRED_FIELDS,
+        FieldSource.TIMESTAMP,
+    ),
+)
+```
+
+For one field, use `field_conflict_strategies`, keyed by the final output field name.
+The value may also be a partial sequence of source names; named sources take precedence
+over sources that are not listed.
+
+```python
+formatter = JsonFormatter(
+    field_conflict_strategy=FieldConflictStrategy.ERROR,
+    field_conflict_strategies={"request_id": ("extra", "message")},
+)
+```
+
+With `KEEP_ALL`, retained values are represented by `FieldValues`, a `list` subclass,
+so they serialize as an array without using a wrapper key that could collide with user
+data. Set `include_field_sources=True` to make each compact entry a
+`[source, value]` pair. The Python object also exposes the sources in its `sources`
+attribute.
+
+`FieldConflictError` messages identify only conflicting output keys and their sources;
+they never include field values.
+
 ### Custom object serialization
 
 Most formatters support `json_default` which is used to control how objects are serialized.

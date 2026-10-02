@@ -25,7 +25,15 @@ import pytest
 ## Application
 import pythonjsonlogger
 import pythonjsonlogger.defaults
-from pythonjsonlogger.core import RESERVED_ATTRS, BaseJsonFormatter, merge_record_extra
+from pythonjsonlogger.core import (
+    RESERVED_ATTRS,
+    BaseJsonFormatter,
+    FieldConflictError,
+    FieldConflictStrategy,
+    FieldSource,
+    FieldValues,
+    merge_record_extra,
+)
 from pythonjsonlogger.json import JsonFormatter
 
 if pythonjsonlogger.ORJSON_AVAILABLE:
@@ -346,6 +354,258 @@ def test_rename_once(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
     assert log_json["LEVEL"] == "INFO"
     assert log_json["levelname"] == msg
     return
+
+
+def test_field_conflict_keep_all_records_sources(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            ["name", "message"],
+            timestamp="event_time",
+            defaults={"shared": "default", "unique_default": True},
+            static_fields={"shared": "static"},
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+            include_field_sources=True,
+        )
+    )
+
+    env.logger.info(
+        {"shared": "message", "unique_message": True},
+        extra={"shared": "extra", "unique_extra": True},
+    )
+    log_json = env.load_json()
+
+    assert log_json["shared"] == [
+        ["defaults", "default"],
+        ["static_fields", "static"],
+        ["message", "message"],
+        ["extra", "extra"],
+    ]
+    assert "event_time" in log_json
+    assert log_json["unique_default"] is True
+    assert log_json["unique_message"] is True
+    assert log_json["unique_extra"] is True
+
+
+@pytest.mark.parametrize("message_order", [("shared", "other"), ("other", "shared")])
+def test_field_conflict_keep_all_order_is_deterministic(
+    env: LoggingEnvironment, message_order: tuple[str, str]
+):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"shared": "default"},
+            static_fields={"shared": "static"},
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+        )
+    )
+
+    message = {message_order[0]: "message" if message_order[0] == "shared" else "other"}
+    message[message_order[1]] = "extra-name" if message_order[1] == "other" else "message"
+    env.logger.info(message, extra={"shared": "extra"})
+
+    assert env.load_json()["shared"] == ["default", "static", "message", "extra"]
+
+
+def test_field_conflict_priority_uses_configured_source_order(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"shared": "default"},
+            static_fields={"shared": "static"},
+            field_conflict_strategy=FieldConflictStrategy.PRIORITY,
+            source_priority=(
+                FieldSource.DEFAULTS,
+                FieldSource.REQUIRED_FIELDS,
+                FieldSource.STATIC_FIELDS,
+                FieldSource.MESSAGE,
+                FieldSource.EXTRA,
+                FieldSource.TIMESTAMP,
+            ),
+        )
+    )
+
+    env.logger.info(
+        {"shared": "message"},
+        extra={"shared": "extra"},
+    )
+
+    assert env.load_json()["shared"] == "extra"
+
+
+def test_field_conflict_strategy_can_be_set_for_one_field(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"first": "default", "second": "default"},
+            static_fields={"first": "static", "second": "static"},
+            field_conflict_strategies={"first": ("message",)},
+        )
+    )
+
+    env.logger.info({"first": "message", "second": "message"})
+    log_json = env.load_json()
+
+    assert log_json["first"] == "message"
+    assert log_json["second"] == "message"
+
+
+def test_field_conflict_strategy_accepts_enum_source_sequence(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"shared": "default"},
+            static_fields={"shared": "static"},
+            field_conflict_strategies={"shared": (FieldSource.MESSAGE, FieldSource.EXTRA)},
+        )
+    )
+
+    env.logger.info({"shared": "message"}, extra={"shared": "extra"})
+
+    assert env.load_json()["shared"] == "extra"
+
+
+def test_field_conflict_strategy_validates_configuration():
+    with pytest.raises(ValueError, match="valid"):
+        JsonFormatter(field_conflict_strategy="unknown")
+
+    with pytest.raises(ValueError, match="source_priority is required"):
+        JsonFormatter(field_conflict_strategy=FieldConflictStrategy.PRIORITY)
+
+    with pytest.raises(ValueError, match="duplicate sources"):
+        JsonFormatter(source_priority=(FieldSource.EXTRA, FieldSource.EXTRA))
+
+    with pytest.raises(ValueError, match="every field source"):
+        JsonFormatter(source_priority=(FieldSource.EXTRA,))
+
+
+def test_rename_conflicts_are_resolved_from_original_fields(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"a": "a-default", "b": "b-default"},
+            rename_fields={"a": "b", "b": "b"},
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+        )
+    )
+
+    env.logger.info("message")
+    log_json = env.load_json()
+
+    assert log_json["b"] == ["a-default", "b-default"]
+    assert "c" not in log_json
+
+
+def test_rename_chain_is_resolved_simultaneously(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            defaults={"a": "a-default", "b": "b-default"},
+            rename_fields={"a": "b", "b": "c"},
+        )
+    )
+
+    env.logger.info("message")
+    log_json = env.load_json()
+
+    assert log_json["b"] == "a-default"
+    assert log_json["c"] == "b-default"
+
+
+def test_rename_multiple_fields_to_same_name_is_one_conflict(env: LoggingEnvironment):
+    formatter = JsonFormatter(
+        rename_fields={"alpha": "same", "beta": "same"},
+        field_conflict_strategy=FieldConflictStrategy.ERROR,
+    )
+    record = logging.LogRecord(
+        "name",
+        logging.INFO,
+        "",
+        1,
+        "message",
+        None,
+        None,
+    )
+    record.alpha = "alpha-secret"
+    record.beta = "beta-secret"
+
+    with pytest.raises(FieldConflictError) as exc_info:
+        formatter.format(record)
+
+    assert "'same'" in str(exc_info.value)
+    assert "extra" in str(exc_info.value)
+    assert "alpha-secret" not in str(exc_info.value)
+    assert "beta-secret" not in str(exc_info.value)
+
+
+def test_field_conflict_error_message_contains_only_key_and_sources(env: LoggingEnvironment):
+    formatter = JsonFormatter(
+        defaults={"shared": "default-secret"},
+        static_fields={"shared": "static-secret"},
+        field_conflict_strategy=FieldConflictStrategy.ERROR,
+    )
+    record = logging.LogRecord(
+        "name",
+        logging.INFO,
+        "",
+        1,
+        {"shared": "message-secret"},
+        None,
+        None,
+    )
+    record.shared = "extra-secret"
+    record.message = ""
+
+    with pytest.raises(FieldConflictError) as exc_info:
+        formatter.format(record)
+
+    message = str(exc_info.value)
+    assert "'shared'" in message
+    assert "defaults" in message
+    assert "static_fields" in message
+    assert "message" in message
+    assert "extra" in message
+    assert "secret" not in message
+
+
+def test_field_values_are_serialized_as_plain_lists():
+    values = FieldValues(["one", "two"], [FieldSource.DEFAULTS, FieldSource.MESSAGE])
+
+    assert isinstance(values, list)
+    assert values.sources == ("defaults", "message")
+    assert json.dumps(values) == '["one", "two"]'
+
+
+def test_keep_all_captures_every_source_in_one_record(env: LoggingEnvironment):
+    env.set_formatter(
+        JsonFormatter(
+            ["levelname"],
+            style=",",
+            timestamp="timestamp_source",
+            defaults={"event_time": "defaults"},
+            static_fields={"event_time": "static_fields"},
+            rename_fields={"levelname": "event_time", "timestamp_source": "event_time"},
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+            include_field_sources=True,
+        )
+    )
+
+    env.logger.info(
+        {"event_time": "message"},
+        extra={"event_time": "extra"},
+    )
+    log_json = env.load_json()
+
+    assert [entry[0] for entry in log_json["event_time"]] == [
+        "defaults",
+        "required_fields",
+        "static_fields",
+        "message",
+        "extra",
+        "timestamp",
+    ]
+    assert [entry[1] for entry in log_json["event_time"][:5]] == [
+        "defaults",
+        "INFO",
+        "static_fields",
+        "message",
+        "extra",
+    ]
+    assert log_json["event_time"][5][0] == "timestamp"
+    assert isinstance(log_json["event_time"][5][1], str)
 
 
 @pytest.mark.parametrize("class_", ALL_FORMATTERS)

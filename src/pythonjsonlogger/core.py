@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 ## Standard Library
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import logging
 import re
 import string
 import sys
 from typing import TypeAlias, Any
-from collections.abc import Container, Sequence
+from collections.abc import Container, Mapping, Sequence
 
 ## Installed
 
@@ -76,6 +78,100 @@ LogData: TypeAlias = dict[str, Any]
 """
 
 
+class FieldSource(str, Enum):
+    """Sources from which a log field value can originate."""
+
+    DEFAULTS = "defaults"
+    REQUIRED_FIELDS = "required_fields"
+    STATIC_FIELDS = "static_fields"
+    MESSAGE = "message"
+    EXTRA = "extra"
+    TIMESTAMP = "timestamp"
+
+
+class FieldConflictStrategy(str, Enum):
+    """Strategies used when more than one source provides the same field."""
+
+    OVERRIDE = "override"
+    PRIORITY = "priority"
+    KEEP_ALL = "keep_all"
+    ERROR = "error"
+
+
+FIELD_SOURCE_ORDER: tuple[FieldSource, ...] = (
+    FieldSource.DEFAULTS,
+    FieldSource.REQUIRED_FIELDS,
+    FieldSource.STATIC_FIELDS,
+    FieldSource.MESSAGE,
+    FieldSource.EXTRA,
+    FieldSource.TIMESTAMP,
+)
+"""Default source precedence, from lowest to highest.
+
+This order preserves the formatter's historical step-by-step override behaviour.
+"""
+
+
+class FieldValues(list[Any]):
+    """A list containing every value supplied for a conflicting field.
+
+    The list subclass is serialized as a plain JSON array, so retained values do
+    not occupy a user-supplied object key.
+    """
+
+    def __init__(
+        self,
+        values: Sequence[Any] = (),
+        sources: Sequence[FieldSource | str] = (),
+    ) -> None:
+        super().__init__(values)
+        self.sources = tuple(
+            source.value if isinstance(source, FieldSource) else str(source)
+            for source in sources
+        )
+
+
+class FieldConflictError(ValueError):
+    """Raised when field sources conflict and the selected strategy is `error`.
+
+    The error message intentionally contains field names and sources, but never
+    the conflicting values.
+    """
+
+    def __init__(self, conflicts: Mapping[Any, Sequence[FieldSource | str]]) -> None:
+        self.conflicts = {
+            key: [
+                source.value if isinstance(source, FieldSource) else str(source)
+                for source in sources
+            ]
+            for key, sources in conflicts.items()
+        }
+
+        descriptions = []
+        for key in sorted(self.conflicts, key=_field_sort_key):
+            sources = ", ".join(self.conflicts[key])
+            descriptions.append(f"{key!r} (sources: {sources})")
+        super().__init__("Conflicting log field values: " + "; ".join(descriptions))
+
+
+@dataclass(frozen=True)
+class _FieldCandidate:
+    source: FieldSource
+    original_field: Any
+    value: Any
+
+
+ResolvedConflictStrategy: TypeAlias = FieldConflictStrategy | tuple[FieldSource | str, ...]
+FieldConflictStrategies: TypeAlias = (
+    Mapping[Any, FieldConflictStrategy | Sequence[FieldSource | str] | str | None]
+    | None
+)
+
+
+def _field_sort_key(field: Any) -> tuple[str, str]:
+    return (type(field).__name__, str(field))
+
+
 ### FUNCTIONS
 ### ============================================================================
 def merge_record_extra(
@@ -134,6 +230,10 @@ class BaseJsonFormatter(logging.Formatter):
         reserved_attrs: Sequence[str] | None = None,
         timestamp: bool | str = False,
         defaults: dict[str, Any] | None = None,
+        field_conflict_strategy: ResolvedConflictStrategy | str | None = None,
+        field_conflict_strategies: FieldConflictStrategies = None,
+        source_priority: Sequence[FieldSource | str] | None = None,
+        include_field_sources: bool = False,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
     ) -> None:
@@ -158,6 +258,17 @@ class BaseJsonFormatter(logging.Formatter):
                 outputting the json log record. If string is passed, timestamp will be added
                 to log record using string as key. If True boolean is passed, timestamp key
                 will be "timestamp". Defaults to False/off.
+            field_conflict_strategy: strategy for fields supplied by more than one source.
+                Defaults to `FieldConflictStrategy.OVERRIDE`, which preserves the historical
+                precedence defaults, required fields, static fields, message, extra and
+                timestamp. `PRIORITY` uses `source_priority`, `KEEP_ALL` retains every value,
+                and `ERROR` raises `FieldConflictError`. A sequence of source names may also
+                be supplied to select by that priority.
+            field_conflict_strategies: per-output-field overrides for
+                `field_conflict_strategy`. Fields are identified after renaming.
+            source_priority: order of field sources from lowest to highest precedence.
+            include_field_sources: when retaining all values, serialize each value as a
+                compact `(source, value)` pair.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
 
@@ -226,6 +337,24 @@ class BaseJsonFormatter(logging.Formatter):
         self.rename_fields_keep_missing = rename_fields_keep_missing
         self.reserved_attrs = set(reserved_attrs if reserved_attrs is not None else RESERVED_ATTRS)
         self.timestamp = timestamp
+        self.source_priority = self._normalize_source_priority(source_priority)
+        self.field_conflict_strategy = self._normalize_conflict_strategy(
+            field_conflict_strategy, require_source_priority=True
+        )
+        self.field_conflict_strategies = {}
+        if field_conflict_strategies is not None:
+            for key, strategy in field_conflict_strategies.items():
+                needs_source_priority = (
+                    (
+                        type(strategy) is FieldConflictStrategy
+                        and strategy == FieldConflictStrategy.PRIORITY
+                        and self.source_priority is None
+                    )
+                )
+                self.field_conflict_strategies[key] = self._normalize_conflict_strategy(
+                    strategy, require_source_priority=needs_source_priority
+                )
+        self.include_field_sources = include_field_sources
 
         self._skip_fields = set(self._required_fields)
         self._skip_fields.update(self.reserved_attrs)
@@ -233,6 +362,57 @@ class BaseJsonFormatter(logging.Formatter):
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
         return
+
+    @staticmethod
+    def _normalize_source_priority(
+        source_priority: Sequence[FieldSource | str] | None,
+    ) -> tuple[FieldSource, ...] | None:
+        if source_priority is None:
+            return None
+
+        normalized = tuple(
+            source if isinstance(source, FieldSource) else FieldSource(source)
+            for source in source_priority
+        )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("source_priority must not contain duplicate sources")
+        if set(normalized) != set(FIELD_SOURCE_ORDER):
+            raise ValueError("source_priority must contain every field source exactly once")
+        return normalized
+
+    def _normalize_conflict_strategy(
+        self,
+        strategy: ResolvedConflictStrategy | str | None,
+        require_source_priority: bool = True,
+    ) -> ResolvedConflictStrategy:
+        if strategy is None:
+            return FieldConflictStrategy.OVERRIDE
+
+        if type(strategy) is FieldConflictStrategy:
+            resolved = strategy
+        elif isinstance(strategy, Sequence) and not isinstance(strategy, (bytes, str)):
+            sources = tuple(
+                source.value if isinstance(source, FieldSource) else str(source)
+                for source in strategy
+            )
+            if len(sources) != len(set(sources)):
+                raise ValueError("source priority must not contain duplicate sources")
+            for source in sources:
+                FieldSource(source)
+            resolved = sources
+        elif isinstance(strategy, str):
+            resolved = FieldConflictStrategy(strategy)
+        else:
+            raise ValueError("Invalid field conflict strategy")
+
+        if (
+            type(resolved) is FieldConflictStrategy
+            and resolved == FieldConflictStrategy.PRIORITY
+            and require_source_priority
+            and self.source_priority is None
+        ):
+            raise ValueError("source_priority is required when using the priority strategy")
+        return resolved
 
     def format(self, record: logging.LogRecord) -> str:
         """Formats a log record and serializes to json
@@ -356,28 +536,41 @@ class BaseJsonFormatter(logging.Formatter):
 
         *Changed in 4.0*: `log_record` renamed to `log_data`
         """
-        for field in self.defaults:
-            log_data[self._get_rename(field)] = self.defaults[field]
+        candidates: dict[Any, list[_FieldCandidate]] = {}
+
+        def add_candidate(source: FieldSource, original_field: Any, value: Any) -> None:
+            output_field = self._get_rename(original_field)
+            candidates.setdefault(output_field, []).append(
+                _FieldCandidate(source, original_field, value)
+            )
+
+        for field, value in self.defaults.items():
+            add_candidate(FieldSource.DEFAULTS, field, value)
 
         for field in self._required_fields:
-            log_data[self._get_rename(field)] = record.__dict__.get(field)
+            add_candidate(FieldSource.REQUIRED_FIELDS, field, record.__dict__.get(field))
 
-        for data_dict in [self.static_fields, message_dict]:
-            for key, value in data_dict.items():
-                log_data[self._get_rename(key)] = value
+        for field, value in self.static_fields.items():
+            add_candidate(FieldSource.STATIC_FIELDS, field, value)
 
-        merge_record_extra(
-            record,
-            log_data,
-            reserved=self._skip_fields,
-            rename_fields=self.rename_fields,
-        )
+        for field, value in message_dict.items():
+            add_candidate(FieldSource.MESSAGE, field, value)
+
+        for field, value in record.__dict__.items():
+            if field not in self._skip_fields and not (
+                hasattr(field, "startswith") and field.startswith("_")
+            ):
+                add_candidate(FieldSource.EXTRA, field, value)
 
         if self.timestamp:
-            key = self.timestamp if isinstance(self.timestamp, str) else "timestamp"
-            log_data[self._get_rename(key)] = datetime.fromtimestamp(
-                record.created, tz=timezone.utc
+            field = self.timestamp if isinstance(self.timestamp, str) else "timestamp"
+            add_candidate(
+                FieldSource.TIMESTAMP,
+                field,
+                datetime.fromtimestamp(record.created, tz=timezone.utc),
             )
+
+        log_data.update(self._resolve_field_candidates(candidates))
 
         if self.rename_fields_keep_missing:
             for field in self.rename_fields.values():
@@ -385,7 +578,115 @@ class BaseJsonFormatter(logging.Formatter):
                     log_data[field] = None
         return
 
-    def _get_rename(self, key: str) -> str:
+    def _resolve_field_candidates(
+        self, candidates: Mapping[Any, Sequence[_FieldCandidate]]
+    ) -> dict[Any, Any]:
+        default_order = {source: index for index, source in enumerate(FIELD_SOURCE_ORDER)}
+        source_priority = self.source_priority
+        custom_priority_order = (
+            {source: index for index, source in enumerate(source_priority)}
+            if source_priority is not None
+            else {}
+        )
+        resolved: dict[Any, Any] = {}
+        conflicts: dict[Any, list[str]] = {}
+
+        for output_field, field_candidates in candidates.items():
+            if len(field_candidates) == 1:
+                resolved[output_field] = field_candidates[0].value
+                continue
+
+            sources = {candidate.source for candidate in field_candidates}
+            ordered_candidates = sorted(
+                field_candidates,
+                key=lambda candidate: self._candidate_sort_key(candidate, default_order),
+            )
+            strategy = self.field_conflict_strategies.get(
+                output_field, self.field_conflict_strategy
+            )
+
+            if strategy is FieldConflictStrategy.OVERRIDE:
+                resolved[output_field] = ordered_candidates[-1].value
+            elif strategy is FieldConflictStrategy.PRIORITY:
+                priority_order = custom_priority_order or {
+                    source: rank for source, rank in default_order.items()
+                }
+                resolved[output_field] = sorted(
+                    ordered_candidates,
+                    key=lambda candidate: self._candidate_priority_key(candidate, priority_order),
+                )[-1].value
+            elif strategy is FieldConflictStrategy.KEEP_ALL:
+                values = FieldValues(
+                    [candidate.value for candidate in ordered_candidates],
+                    [candidate.source for candidate in ordered_candidates],
+                )
+                if self.include_field_sources:
+                    values = FieldValues(
+                        [
+                            [candidate.source.value, candidate.value]
+                            for candidate in ordered_candidates
+                        ],
+                        [candidate.source for candidate in ordered_candidates],
+                    )
+                resolved[output_field] = values
+            elif strategy is FieldConflictStrategy.ERROR:
+                conflicts[output_field] = sorted(
+                    {source.value for source in sources},
+                )
+            elif isinstance(strategy, tuple):
+                priority_order = self._custom_strategy_order(strategy)
+                resolved[output_field] = sorted(
+                    ordered_candidates,
+                    key=lambda candidate: self._candidate_priority_key(candidate, priority_order),
+                )[-1].value
+
+        if conflicts:
+            raise FieldConflictError(conflicts)
+        return resolved
+
+    @staticmethod
+    def _candidate_sort_key(
+        candidate: _FieldCandidate,
+        default_order: Mapping[FieldSource, int],
+    ) -> tuple[int, str, str]:
+        return (
+            default_order[candidate.source],
+            type(candidate.original_field).__name__,
+            str(candidate.original_field),
+        )
+
+    @staticmethod
+    def _candidate_priority_key(
+        candidate: _FieldCandidate,
+        priority_order: Mapping[FieldSource | str, int],
+    ) -> tuple[int, int, int, str, str]:
+        if candidate.source in priority_order:
+            explicit_rank = priority_order[candidate.source]
+            configured = 1
+        else:
+            explicit_rank = -1
+            configured = 0
+        return (
+            configured,
+            explicit_rank if configured else -1,
+            FIELD_SOURCE_ORDER.index(candidate.source),
+            type(candidate.original_field).__name__,
+            str(candidate.original_field),
+        )
+
+    @staticmethod
+    def _custom_strategy_order(
+        strategy: tuple[str, ...],
+    ) -> dict[FieldSource | str, int]:
+        sources = tuple(FieldSource(source).value for source in strategy)
+        if len(sources) != len(set(sources)):
+            raise ValueError("source priority must not contain duplicate sources")
+        unknown_sources = set(sources) - {source.value for source in FIELD_SOURCE_ORDER}
+        if unknown_sources:
+            raise ValueError(f"Unknown field sources: {', '.join(sorted(unknown_sources))}")
+        return {FieldSource(source): index for index, source in enumerate(sources)}
+
+    def _get_rename(self, key: Any) -> Any:
         return self.rename_fields.get(key, key)
 
     # Child Methods
