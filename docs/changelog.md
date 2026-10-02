@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `JsonFormatter` now supports `max_bytes`, `required_fields`, and `field_priority` options. Records whose serialized form exceeds the UTF-8 byte budget are trimmed in priority order - strings are shortened, arrays and dictionaries are dropped down with explicit truncation markers - while required fields (e.g. time and level) are always preserved. Records that cannot be trimmed far enough raise `pythonjsonlogger.exception.LogRecordTooLargeError` instead of being emitted over-sized.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 

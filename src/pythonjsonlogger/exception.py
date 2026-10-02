@@ -25,3 +25,7 @@ class MissingPackageError(ImportError, PythonJsonLoggerError):
             msg += f" It can be installed using 'python-json-logger[{extras_name}]'."
         super().__init__(msg)
         return
+
+
+class LogRecordTooLargeError(PythonJsonLoggerError):
+    "A log record could not be trimmed to fit within the configured `max_bytes` budget"

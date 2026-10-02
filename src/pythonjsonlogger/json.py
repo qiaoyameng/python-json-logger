@@ -13,7 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Container, Sequence
 import warnings
 
 ## Application
@@ -73,6 +73,9 @@ class JsonFormatter(core.BaseJsonFormatter):
         json_serializer: Callable = json.dumps,
         json_indent: int | str | None = None,
         json_ensure_ascii: bool = True,
+        max_bytes: int | None = None,
+        required_fields: Container[str] | None = None,
+        field_priority: Sequence[str] | None = None,
         **kwargs,
     ) -> None:
         """
@@ -84,7 +87,22 @@ class JsonFormatter(core.BaseJsonFormatter):
                 that will be used to serialize the log record.
             json_indent: indent parameter for the `json_serializer`
             json_ensure_ascii: `ensure_ascii` parameter for the `json_serializer`
+            max_bytes: maximum allowed UTF-8 byte length of a serialized log
+                record (including `prefix`). Records that exceed the budget are
+                trimmed; see
+                [trim_log_data_to_budget][pythonjsonlogger.core.trim_log_data_to_budget].
+                `None` (the default) disables trimming.
+            required_fields: field names (after renaming) that are never trimmed
+                or removed when enforcing `max_bytes`, e.g. `["asctime", "levelname"]`.
+            field_priority: field names (after renaming) to sacrifice first when
+                enforcing `max_bytes`, in order. Remaining non-required fields
+                are trimmed afterwards, most recently added first.
             kwargs: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
+
+        *Added in 4.2.1*: `max_bytes`, `required_fields`, and `field_priority`.
+
+        Raises:
+            ValueError: if `max_bytes` is not a positive integer.
         """
         super().__init__(*args, **kwargs)
 
@@ -95,6 +113,12 @@ class JsonFormatter(core.BaseJsonFormatter):
         self.json_ensure_ascii = json_ensure_ascii
         if not self.json_encoder and not self.json_default:
             self.json_encoder = JsonEncoder
+
+        if max_bytes is not None and max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer or None")
+        self.max_bytes = max_bytes
+        self.required_fields = set(required_fields) if required_fields is not None else set()
+        self.field_priority = list(field_priority) if field_priority is not None else []
         return
 
     def jsonify_log_record(self, log_data: core.LogData) -> str:
@@ -106,6 +130,36 @@ class JsonFormatter(core.BaseJsonFormatter):
             indent=self.json_indent,
             ensure_ascii=self.json_ensure_ascii,
         )
+
+    def serialize_log_record(self, log_data: core.LogData) -> str:
+        """Returns the final representation of the data to be logged
+
+        When `max_bytes` is set and the serialized record exceeds the UTF-8 byte
+        budget, the record is trimmed with
+        [trim_log_data_to_budget][pythonjsonlogger.core.trim_log_data_to_budget]
+        before serialization. Records that already fit (including exactly equal
+        to the budget) are returned unchanged.
+
+        Raises:
+            pythonjsonlogger.exception.LogRecordTooLargeError: when the record
+                cannot be trimmed to fit within `max_bytes`.
+        """
+        if self.max_bytes is None:
+            return super().serialize_log_record(log_data)
+
+        budget = self.max_bytes - len(self.prefix.encode("utf-8"))
+        serialized = self.jsonify_log_record(log_data)
+        if len(serialized.encode("utf-8")) <= budget:
+            return self.prefix + serialized
+
+        trimmed = core.trim_log_data_to_budget(
+            log_data,
+            serialize=self.jsonify_log_record,
+            max_bytes=budget,
+            required_fields=self.required_fields,
+            field_priority=self.field_priority,
+        )
+        return self.prefix + self.jsonify_log_record(trimmed)
 
 
 ### DEPRECATED COMPATIBILITY

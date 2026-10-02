@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import datetime
 import enum
+import functools
 import io
 import json
 import logging
@@ -25,7 +26,14 @@ import pytest
 ## Application
 import pythonjsonlogger
 import pythonjsonlogger.defaults
-from pythonjsonlogger.core import RESERVED_ATTRS, BaseJsonFormatter, merge_record_extra
+from pythonjsonlogger.core import (
+    RESERVED_ATTRS,
+    TRUNCATION_MARKER,
+    TRUNCATED_KEY,
+    BaseJsonFormatter,
+    merge_record_extra,
+)
+from pythonjsonlogger.exception import LogRecordTooLargeError
 from pythonjsonlogger.json import JsonFormatter
 
 if pythonjsonlogger.ORJSON_AVAILABLE:
@@ -924,4 +932,264 @@ def test_json_ensure_ascii_false(env: LoggingEnvironment):
     # Note: we don't use env.load_json as we want to know the raw output
     msg = env.buffer.getvalue().split('"message": "', 1)[1].split('"', 1)[0]
     assert msg == "Привет"
+    return
+
+
+## JsonFormatter max_bytes
+## -----------------------------------------------------------------------------
+def _make_record(msg: Any = "hello", **extra: Any) -> logging.LogRecord:
+    record = logging.LogRecord("test", logging.INFO, __file__, 1, msg, (), None)
+    for key, value in extra.items():
+        setattr(record, key, value)
+    return record
+
+
+def _assert_valid_json_within_budget(output: str, max_bytes: int) -> Any:
+    encoded = output.encode("utf-8")
+    assert len(encoded) <= max_bytes, f"output is {len(encoded)} bytes, budget is {max_bytes}"
+    return json.loads(output)
+
+
+def test_max_bytes_exact_fit_not_trimmed():
+    fmt = "%(levelname)s %(message)s"
+    message = "x" * 100
+    record = _make_record(message)
+
+    untrimmed = JsonFormatter(fmt).format(record)
+    exact_budget = len(untrimmed.encode("utf-8"))
+
+    formatter = JsonFormatter(fmt, max_bytes=exact_budget)
+    output = formatter.format(record)
+
+    assert output == untrimmed
+    assert json.loads(output)["message"] == message
+    return
+
+
+def test_max_bytes_one_over_trims():
+    fmt = "%(levelname)s %(message)s"
+    record = _make_record("x" * 100)
+    exact_budget = len(JsonFormatter(fmt).format(record).encode("utf-8"))
+
+    formatter = JsonFormatter(fmt, max_bytes=exact_budget - 1)
+    log_json = _assert_valid_json_within_budget(formatter.format(record), exact_budget - 1)
+
+    assert log_json["message"].endswith(TRUNCATION_MARKER)
+    assert log_json["levelname"] == "INFO"
+    return
+
+
+def test_max_bytes_invalid_value():
+    with pytest.raises(ValueError):
+        JsonFormatter(max_bytes=0)
+    with pytest.raises(ValueError):
+        JsonFormatter(max_bytes=-10)
+    return
+
+
+@pytest.mark.parametrize("ensure_ascii", [True, False])
+def test_max_bytes_chinese_and_emoji(ensure_ascii: bool):
+    message = "你好世界，这是一条日志。" * 20 + "🎉🔥💥" * 20
+    max_bytes = 200
+    formatter = JsonFormatter(
+        "%(levelname)s %(message)s",
+        max_bytes=max_bytes,
+        required_fields=["levelname"],
+        json_ensure_ascii=ensure_ascii,
+    )
+
+    log_json = _assert_valid_json_within_budget(formatter.format(_make_record(message)), max_bytes)
+
+    assert log_json["levelname"] == "INFO"
+    assert log_json["message"].endswith(TRUNCATION_MARKER)
+    # the string is cut on character boundaries, never mid-character
+    kept = log_json["message"][: -len(TRUNCATION_MARKER)]
+    assert message.startswith(kept)
+    return
+
+
+def test_max_bytes_quotes_and_backslashes():
+    message = 'quote " and backslash \\ and newline \n' * 30
+    max_bytes = 150
+    formatter = JsonFormatter("%(message)s", max_bytes=max_bytes)
+
+    log_json = _assert_valid_json_within_budget(formatter.format(_make_record(message)), max_bytes)
+
+    assert log_json["message"].endswith(TRUNCATION_MARKER)
+    return
+
+
+def test_max_bytes_large_array():
+    items = list(range(1000))
+    record = _make_record("hello", items=items)
+    max_bytes = 300
+    formatter = JsonFormatter(
+        "%(levelname)s %(message)s", max_bytes=max_bytes, required_fields=["levelname"]
+    )
+
+    log_json = _assert_valid_json_within_budget(formatter.format(record), max_bytes)
+
+    assert isinstance(log_json["items"], list)
+    assert TRUNCATION_MARKER in log_json["items"][-1]
+    assert log_json["items"][:-1] == items[: len(log_json["items"]) - 1]
+    # the shared record and its array are not modified
+    assert record.items == list(range(1000))
+    return
+
+
+def test_max_bytes_long_exc_info():
+    try:
+        raise ValueError("boom " + "detail " * 200)
+    except ValueError:
+        record = _make_record("with exception")
+        record.exc_info = sys.exc_info()
+
+    max_bytes = 400
+    formatter = JsonFormatter(
+        "%(levelname)s %(message)s", max_bytes=max_bytes, required_fields=["levelname"]
+    )
+    log_json = _assert_valid_json_within_budget(formatter.format(record), max_bytes)
+
+    assert log_json["levelname"] == "INFO"
+    assert "exc_info" not in log_json or log_json["exc_info"].endswith(TRUNCATION_MARKER)
+    return
+
+
+def test_max_bytes_required_fields_kept():
+    record = _make_record("a message that is far too long " * 20, extra_field="x" * 500)
+    max_bytes = 120
+    formatter = JsonFormatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        max_bytes=max_bytes,
+        required_fields=["asctime", "levelname"],
+    )
+
+    log_json = _assert_valid_json_within_budget(formatter.format(record), max_bytes)
+
+    assert log_json["levelname"] == "INFO"
+    assert "asctime" in log_json
+    assert "extra_field" not in log_json
+    return
+
+
+def test_max_bytes_field_priority_order():
+    record = _make_record("m" * 200, first="a" * 200, second="b" * 200)
+    max_bytes = 250
+    formatter = JsonFormatter(
+        "%(message)s",
+        max_bytes=max_bytes,
+        field_priority=["first", "second"],
+    )
+
+    log_json = _assert_valid_json_within_budget(formatter.format(record), max_bytes)
+
+    # `first` is sacrificed before `second` and `message`
+    assert "first" not in log_json or len(log_json["first"]) < 200
+    assert log_json.get("second", "") == "b" * 200 or "first" not in log_json
+    return
+
+
+def test_max_bytes_dict_value_marker():
+    record = _make_record("hello", nested={f"key_{i}": "v" * 50 for i in range(20)})
+    max_bytes = 300
+    formatter = JsonFormatter("%(levelname)s %(message)s", max_bytes=max_bytes)
+
+    log_json = _assert_valid_json_within_budget(formatter.format(record), max_bytes)
+
+    nested = log_json.get("nested")
+    assert nested is None or TRUNCATED_KEY in nested
+    return
+
+
+def test_max_bytes_too_small_raises():
+    record = _make_record("hello")
+    formatter = JsonFormatter(
+        "%(asctime)s %(levelname)s",
+        max_bytes=10,
+        required_fields=["asctime", "levelname"],
+    )
+
+    with pytest.raises(LogRecordTooLargeError, match="max_bytes"):
+        formatter.format(record)
+    return
+
+
+def test_max_bytes_everything_dropped_still_too_big_raises():
+    record = _make_record("x" * 1000, extra="y" * 1000)
+    # budget smaller than the empty object `{}`
+    formatter = JsonFormatter(max_bytes=1)
+
+    with pytest.raises(LogRecordTooLargeError):
+        formatter.format(record)
+    return
+
+
+def test_max_bytes_custom_separators_and_ensure_ascii():
+    serializer = functools.partial(json.dumps, separators=(",", ":"))
+    message = "你好 🎉 " * 50
+    max_bytes = 120
+    formatter = JsonFormatter(
+        "%(levelname)s %(message)s",
+        json_serializer=serializer,
+        json_ensure_ascii=False,
+        max_bytes=max_bytes,
+        required_fields=["levelname"],
+    )
+
+    output = formatter.format(_make_record(message))
+    log_json = _assert_valid_json_within_budget(output, max_bytes)
+
+    assert '": "' not in output  # compact separators were used
+    assert log_json["levelname"] == "INFO"
+    return
+
+
+def test_max_bytes_record_not_modified():
+    shared_list = ["item 🎉"] * 100
+    shared_dict = {f"key_{i}": "值" * 20 for i in range(10)}
+    record = _make_record("message " * 100, shared_list=shared_list, shared_dict=shared_dict)
+    before = dict(record.__dict__)
+
+    formatter = JsonFormatter("%(levelname)s %(message)s", max_bytes=200)
+    _assert_valid_json_within_budget(formatter.format(record), 200)
+
+    # no pre-existing field was removed or altered (format() itself may add
+    # standard attributes such as `message`)
+    for key, value in before.items():
+        assert record.__dict__[key] == value
+    assert shared_list == ["item 🎉"] * 100
+    assert shared_dict == {f"key_{i}": "值" * 20 for i in range(10)}
+    return
+
+
+def test_max_bytes_prefix_counts_towards_budget():
+    record = _make_record("y" * 200)
+    max_bytes = 100
+    formatter = JsonFormatter("%(message)s", prefix="PREFIX: ", max_bytes=max_bytes)
+
+    output = formatter.format(record)
+
+    assert output.startswith("PREFIX: ")
+    assert len(output.encode("utf-8")) <= max_bytes
+    json.loads(output[len("PREFIX: ") :])
+    return
+
+
+def test_max_bytes_via_logger(env: LoggingEnvironment):
+    max_bytes = 200
+    env.set_formatter(
+        JsonFormatter(
+            "%(levelname)s %(message)s",
+            max_bytes=max_bytes,
+            required_fields=["levelname"],
+            json_ensure_ascii=False,
+        )
+    )
+
+    env.logger.info("你好 " * 100)
+
+    output = env.buffer.getvalue().rstrip("\n")
+    log_json = _assert_valid_json_within_budget(output, max_bytes)
+    assert log_json["levelname"] == "INFO"
+    assert log_json["message"].endswith(TRUNCATION_MARKER)
     return

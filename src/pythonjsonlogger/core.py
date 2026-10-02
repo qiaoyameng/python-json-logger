@@ -6,17 +6,19 @@
 from __future__ import annotations
 
 ## Standard Library
+import copy
 from datetime import datetime, timezone
 import logging
 import re
 import string
 import sys
 from typing import TypeAlias, Any
-from collections.abc import Container, Sequence
+from collections.abc import Callable, Container, Sequence
 
 ## Installed
 
 ## Application
+from .exception import LogRecordTooLargeError
 
 
 ### CONSTANTS
@@ -75,6 +77,29 @@ LogData: TypeAlias = dict[str, Any]
 *Changed in 4.0*: renamed from `LogRecord` to `LogData`
 """
 
+TRUNCATION_MARKER = "...[truncated]"
+"""Marker appended to truncated strings and arrays, and used as a stand-in value
+when a field's value has been trimmed down to nothing.
+
+*New in 4.2.1*
+"""
+
+TRUNCATED_KEY = "__truncated__"
+"""Key added to trimmed dictionaries recording how many entries were dropped.
+
+*New in 4.2.1*
+"""
+
+_MAX_TRIM_ROUNDS_PER_FIELD = 16
+"""Maximum number of times a single field is progressively trimmed before it is
+dropped entirely. Bounds the total amount of work so trimming always terminates.
+"""
+
+_DROP = object()
+"""Sentinel returned by `_trim_value` when a value cannot be trimmed any further
+and the field should be removed from the log record.
+"""
+
 
 ### FUNCTIONS
 ### ============================================================================
@@ -103,6 +128,125 @@ def merge_record_extra(
         if key not in reserved and not (hasattr(key, "startswith") and key.startswith("_")):
             target[rename_fields.get(key, key)] = value
     return target
+
+
+def trim_log_data_to_budget(
+    log_data: LogData,
+    serialize: Callable[[LogData], str],
+    max_bytes: int,
+    required_fields: Container[str] = (),
+    field_priority: Sequence[str] = (),
+) -> LogData:
+    """Trim a log record so its serialized form fits within a UTF-8 byte budget.
+
+    Fields are trimmed in priority order: `field_priority` first (in the given
+    order), then any remaining non-required fields in reverse insertion order.
+    String values are shortened and marked with
+    [TRUNCATION_MARKER][pythonjsonlogger.core.TRUNCATION_MARKER], arrays drop
+    their tail elements and gain a marker element, and dictionaries
+    drop entries and gain a [TRUNCATED_KEY][pythonjsonlogger.core.TRUNCATED_KEY]
+    marker. Fields that cannot be trimmed further are removed entirely. Required
+    fields are never trimmed or removed.
+
+    All size decisions use the actual output of `serialize` encoded as UTF-8, so
+    encoder settings such as `ensure_ascii`, escaping, and custom separators are
+    accounted for, and the truncation markers themselves count towards the
+    budget.
+
+    Args:
+        log_data: the data to trim. It is deep-copied first; the input and any
+            objects it references are never modified.
+        serialize: callable producing the final JSON string for a log record.
+        max_bytes: maximum allowed UTF-8 byte length of `serialize(result)`.
+        required_fields: field names that must never be trimmed or removed.
+        field_priority: field names to sacrifice first, in order.
+
+    Raises:
+        LogRecordTooLargeError: when even removing every non-required field
+            cannot bring the record within budget.
+
+    Returns:
+        A new `LogData` whose serialization fits within `max_bytes`.
+
+    *New in 4.2.1*
+    """
+    data = copy.deepcopy(log_data)
+    required = set(required_fields)
+    priority = [field for field in field_priority if field not in required]
+    priority.extend(
+        field for field in reversed(data) if field not in required and field not in priority
+    )
+
+    rounds: dict[str, int] = {}
+    index = 0
+    while (size := len(serialize(data).encode("utf-8"))) > max_bytes:
+        victim = None
+        while index < len(priority):
+            field = priority[index]
+            if field in data and rounds.get(field, 0) < _MAX_TRIM_ROUNDS_PER_FIELD:
+                victim = field
+                break
+            index += 1
+        if victim is None:
+            raise LogRecordTooLargeError(
+                f"Log record could not be trimmed to fit within max_bytes={max_bytes}: "
+                f"all non-required fields were removed but the record still "
+                f"serializes to {size} bytes. Increase max_bytes or remove "
+                f"fields from required_fields."
+            )
+        rounds[victim] = rounds.get(victim, 0) + 1
+        trimmed = _trim_value(data[victim], excess=size - max_bytes)
+        if trimmed is _DROP:
+            del data[victim]
+        else:
+            data[victim] = trimmed
+    return data
+
+
+def _trim_value(value: Any, excess: int) -> Any:
+    """Trim a single field value, returning the trimmed value or `_DROP`.
+
+    Every call makes the value strictly smaller so that trimming always
+    terminates. Truncated strings, arrays, and dictionaries are given explicit
+    markers; values are never cut apart at the byte level.
+    """
+    if isinstance(value, str):
+        if value == TRUNCATION_MARKER:
+            return _DROP
+        # Each character costs at least one byte once encoded, so removing
+        # `excess` characters (plus room for the marker) guarantees progress.
+        cut = max(excess + len(TRUNCATION_MARKER), len(value) // 2, 1)
+        keep = len(value) - cut
+        if keep <= 0:
+            return TRUNCATION_MARKER
+        return value[:keep] + TRUNCATION_MARKER
+
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        if items and items[-1] == TRUNCATION_MARKER:
+            items.pop()
+        if not items:
+            return _DROP
+        keep = len(items) // 2
+        if keep == 0:
+            return [TRUNCATION_MARKER]
+        dropped = len(items) - keep
+        return items[:keep] + [f"{TRUNCATION_MARKER} {dropped} item(s) dropped"]
+
+    if isinstance(value, dict):
+        keys = [key for key in value if key != TRUNCATED_KEY]
+        if not keys:
+            return _DROP
+        keep = len(keys) // 2
+        if keep == 0:
+            return {TRUNCATED_KEY: f"all {len(keys)} field(s) dropped"}
+        dropped = len(keys) - keep
+        trimmed = {key: value[key] for key in keys[:keep]}
+        trimmed[TRUNCATED_KEY] = f"{dropped} field(s) dropped"
+        return trimmed
+
+    # Numbers, booleans, None, and other scalar values cannot be shortened.
+    return _DROP
 
 
 ### CLASSES
