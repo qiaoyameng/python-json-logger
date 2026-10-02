@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `pythonjsonlogger.syslog.SyslogFormatter`, an opt-in formatter that expands RFC 5424 syslog messages into a structured `syslog` object (PRI, version, timestamp, hostname, app name, procid, msgid, structured data, and message body). Parsing honours NILVALUE, field length limits, and structured-data parameter escaping; structured data keeps element/parameter order and duplicates. Source-claimed hostname and severity stay inside the `syslog` object and never overwrite local `LogRecord` metadata. Parse failures can either raise `SyslogParseError` (which reports the byte position without echoing the message) or preserve the original message via `on_parse_error="preserve"`.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 

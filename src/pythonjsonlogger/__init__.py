@@ -9,6 +9,7 @@ import warnings
 
 ## Application
 from . import json
+from . import syslog
 from . import utils
 
 ### CONSTANTS
