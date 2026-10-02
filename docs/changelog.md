@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `pythonjsonlogger.syslog` module with an opt-in `Rfc5424Formatter` that expands RFC 5424 syslog messages into structured fields (PRI, version, timestamp, hostname, app name, procid, msgid, structured data, and message body) under a nested `syslog` object. Supports strict and keep-original-message failure strategies.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 

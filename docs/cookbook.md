@@ -279,3 +279,43 @@ logger.debug(
 )
 print(f"Logging DEBUG using LazyString took: {int(time.time() - start)}s")
 ```
+
+## Parsing RFC 5424 syslog messages
+
+Gateways often forward [RFC 5424](https://www.rfc-editor.org/rfc/rfc5424) syslog messages as a single string, leaving JSON logs with one opaque `message` field. The opt-in `Rfc5424Formatter` expands such messages into structured fields under a nested `syslog` object, keeping the source's claimed metadata (hostname, severity, ...) separate from the local `LogRecord` attributes.
+
+```python
+from pythonjsonlogger.syslog import Rfc5424Formatter
+
+formatter = Rfc5424Formatter("levelname,message", style=",")
+```
+
+Logging `<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su 123 ID47 [exampleSDID@32473 iut="3"] An application event` produces:
+
+```json
+{
+    "levelname": "INFO",
+    "message": "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su 123 ID47 [exampleSDID@32473 iut=\"3\"] An application event",
+    "syslog": {
+        "pri": 34,
+        "facility": 4,
+        "severity": 2,
+        "version": 1,
+        "timestamp": "2003-10-11T22:14:15.003Z",
+        "hostname": "mymachine.example.com",
+        "app_name": "su",
+        "procid": "123",
+        "msgid": "ID47",
+        "structured_data": [
+            {"sd_id": "exampleSDID@32473", "params": [{"name": "iut", "value": "3"}]}
+        ],
+        "message": "An application event"
+    }
+}
+```
+
+By default unparseable messages raise `Rfc5424ParseError` (which reports the byte position of the problem, never the message itself). Pass `strict=False` to instead log the original message unchanged:
+
+```python
+formatter = Rfc5424Formatter("levelname,message", style=",", strict=False)
+```
