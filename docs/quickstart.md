@@ -143,6 +143,29 @@ formatter = JsonFormatter(
 )
 ```
 
+### Field conflicts
+
+A final JSON field can come from `defaults`, required fields, `static_fields`, a
+logged dictionary, `extra` or the timestamp. Use `field_conflict_strategy` to
+control what happens when multiple sources produce the same output field:
+
+- `override` (the default) keeps the existing behaviour.
+- `priority` selects a value using `field_source_priority`.
+- `keep_all` retains every value with source information in a namespaced object.
+- `error` raises `pythonjsonlogger.exception.FieldConflictError`.
+
+```python
+formatter = JsonFormatter(
+    defaults={"environment": "dev"},
+    field_conflict_strategy="keep_all",
+)
+```
+
+Use `field_conflict_strategies` to configure individual output fields, and pass
+`include_field_sources=True` to add source information for fields selected by a
+priority. `compact_field_sources=True` shortens source descriptors to source
+names.
+
 ### Custom object serialization
 
 Most formatters support `json_default` which is used to control how objects are serialized.

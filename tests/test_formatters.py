@@ -25,7 +25,21 @@ import pytest
 ## Application
 import pythonjsonlogger
 import pythonjsonlogger.defaults
-from pythonjsonlogger.core import RESERVED_ATTRS, BaseJsonFormatter, merge_record_extra
+from pythonjsonlogger.core import (
+    FIELD_SOURCE_DEFAULTS,
+    FIELD_SOURCE_EXTRA,
+    FIELD_SOURCE_MESSAGE,
+    FIELD_SOURCE_REQUIRED_FIELDS,
+    FIELD_SOURCE_STATIC_FIELDS,
+    FIELD_SOURCE_TIMESTAMP,
+    FIELD_SOURCES_KEY,
+    FIELD_VALUES_KEY,
+    RESERVED_ATTRS,
+    BaseJsonFormatter,
+    FieldConflictError,
+    FieldConflictStrategy,
+    merge_record_extra,
+)
 from pythonjsonlogger.json import JsonFormatter
 
 if pythonjsonlogger.ORJSON_AVAILABLE:
@@ -85,6 +99,24 @@ def get_traceback_from_exception_followed_by_log_call(env_: LoggingEnvironment) 
         if str_traceback.endswith("\n"):
             str_traceback = str_traceback[:-1]
     return str_traceback
+
+
+def make_record(
+    msg: Any = "message",
+    extra: dict[str, Any] | None = None,
+) -> logging.LogRecord:
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg=msg,
+        args=(),
+        exc_info=None,
+    )
+    for key, value in (extra or {}).items():
+        setattr(record, key, value)
+    return record
 
 
 class SomeClass:
@@ -600,6 +632,194 @@ def test_default_encoder_with_timestamp(env: LoggingEnvironment, class_: type[Ba
 
     assert log_json["timestamp"] == "2017-07-14T02:40:00+00:00"
     return
+
+
+@pytest.mark.parametrize("reverse_inputs", [False, True])
+def test_field_conflict_priority_and_sources(
+    env: LoggingEnvironment, reverse_inputs: bool
+) -> None:
+    formatter = JsonFormatter(
+        "%(levelname)s",
+        defaults={"shared": "default"},
+        static_fields={"shared": "static"},
+        rename_fields={"levelname": "required_only"},
+        timestamp=True,
+        field_conflict_strategy=FieldConflictStrategy.PRIORITY,
+        field_source_priority=[
+            FIELD_SOURCE_TIMESTAMP,
+            FIELD_SOURCE_MESSAGE,
+            FIELD_SOURCE_EXTRA,
+            FIELD_SOURCE_STATIC_FIELDS,
+            FIELD_SOURCE_REQUIRED_FIELDS,
+            FIELD_SOURCE_DEFAULTS,
+        ],
+        include_field_sources=True,
+    )
+    env.set_formatter(formatter)
+
+    message = {"shared": "message"}
+    extra = {"shared": "extra"}
+    if reverse_inputs:
+        message = dict(reversed(list(message.items())))
+        extra = dict(reversed(list(extra.items())))
+
+    env.logger.info(message, extra=extra)  # type: ignore[arg-type]
+    log_json = env.load_json()
+
+    assert log_json["shared"] == "message"
+    assert log_json["required_only"] == "INFO"
+    assert log_json["timestamp"].endswith("+00:00")
+    assert log_json[FIELD_SOURCES_KEY]["shared"] == [
+        {"source": FIELD_SOURCE_MESSAGE, "field": "shared"}
+    ]
+    assert log_json[FIELD_SOURCES_KEY]["timestamp"] == [
+        {"source": FIELD_SOURCE_TIMESTAMP, "field": "timestamp"}
+    ]
+    assert log_json[FIELD_SOURCES_KEY]["required_only"] == [
+        {"source": FIELD_SOURCE_REQUIRED_FIELDS, "field": "levelname"}
+    ]
+
+
+def test_field_conflict_keep_all_compact(env: LoggingEnvironment) -> None:
+    env.set_formatter(
+        JsonFormatter(
+            "%(levelname)s",
+            defaults={"shared": "default", "only_default": "yes"},
+            static_fields={"shared": "static"},
+            rename_fields={"levelname": "shared"},
+            timestamp="shared",
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+            include_field_sources=True,
+            compact_field_sources=True,
+        )
+    )
+
+    env.logger.info({"shared": "message"}, extra={"shared": "extra"})  # type: ignore[arg-type]
+    log_json = env.load_json()
+
+    assert log_json["shared"] == {
+        FIELD_SOURCES_KEY: [
+            FIELD_SOURCE_TIMESTAMP,
+            FIELD_SOURCE_EXTRA,
+            FIELD_SOURCE_MESSAGE,
+            FIELD_SOURCE_STATIC_FIELDS,
+            FIELD_SOURCE_REQUIRED_FIELDS,
+            FIELD_SOURCE_DEFAULTS,
+        ],
+        FIELD_VALUES_KEY: [
+            log_json["shared"][FIELD_VALUES_KEY][0],
+            "extra",
+            "message",
+            "static",
+            "INFO",
+            "default",
+        ],
+    }
+    assert log_json["shared"][FIELD_VALUES_KEY][0].endswith("+00:00")
+    assert log_json[FIELD_SOURCES_KEY]["only_default"] == [FIELD_SOURCE_DEFAULTS]
+
+
+def test_field_conflict_strategy_is_per_field(env: LoggingEnvironment) -> None:
+    formatter = JsonFormatter(
+        "%(levelname)s",
+        defaults={"keep": "default", "raise_field": "default"},
+        static_fields={"keep": "static", "raise_field": "static"},
+        field_conflict_strategy=FieldConflictStrategy.ERROR,
+        field_conflict_strategies={"keep": FieldConflictStrategy.KEEP_ALL},
+    )
+    env.set_formatter(formatter)
+    record = make_record(
+        {"keep": "message", "raise_field": "message"},
+        {"keep": "extra", "raise_field": "extra"},
+    )
+
+    with pytest.raises(FieldConflictError) as error:
+        formatter.format(record)
+
+    assert "raise_field" in str(error.value)
+    assert "defaults" in str(error.value)
+    assert "static_fields" in str(error.value)
+    assert "message" in str(error.value)
+    assert "extra" in str(error.value)
+
+
+@pytest.mark.parametrize("reverse_inputs", [False, True])
+def test_rename_conflicts_are_resolved_from_original_fields(
+    env: LoggingEnvironment, reverse_inputs: bool
+) -> None:
+    static_fields = {"a": "static-a", "b": "static-b"}
+    message = {"a": "message-a"}
+    extra = {"a": "extra-a"}
+    if reverse_inputs:
+        static_fields = dict(reversed(list(static_fields.items())))
+        message = dict(reversed(list(message.items())))
+        extra = dict(reversed(list(extra.items())))
+
+    formatter = JsonFormatter(
+        "%(levelname)s",
+        static_fields=static_fields,
+        rename_fields={"a": "b", "b": "c"},
+        field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+    )
+    env.set_formatter(formatter)
+
+    env.logger.info(message, extra=extra)  # type: ignore[arg-type]
+    log_json = env.load_json()
+
+    assert log_json["b"] == {
+        FIELD_SOURCES_KEY: [
+            {"source": FIELD_SOURCE_EXTRA, "field": "a"},
+            {"source": FIELD_SOURCE_MESSAGE, "field": "a"},
+            {"source": FIELD_SOURCE_STATIC_FIELDS, "field": "a"},
+        ],
+        FIELD_VALUES_KEY: ["extra-a", "message-a", "static-a"],
+    }
+    assert log_json["c"] == "static-b"
+
+
+@pytest.mark.parametrize("reverse_inputs", [False, True])
+def test_multiple_fields_renamed_to_same_output(
+    env: LoggingEnvironment, reverse_inputs: bool
+) -> None:
+    fields = {"a": "from-a", "b": "from-b"}
+    if reverse_inputs:
+        fields = dict(reversed(list(fields.items())))
+
+    env.set_formatter(
+        JsonFormatter(
+            rename_fields={"a": "shared", "b": "shared"},
+            field_conflict_strategy=FieldConflictStrategy.KEEP_ALL,
+        )
+    )
+    env.logger.info("message", extra=fields)  # type: ignore[arg-type]
+    log_json = env.load_json()
+
+    assert log_json["shared"] == {
+        FIELD_SOURCES_KEY: [
+            {"source": FIELD_SOURCE_EXTRA, "field": "a"},
+            {"source": FIELD_SOURCE_EXTRA, "field": "b"},
+        ],
+        FIELD_VALUES_KEY: ["from-a", "from-b"],
+    }
+
+
+def test_conflict_error_does_not_include_values(env: LoggingEnvironment) -> None:
+    formatter = JsonFormatter(
+        "%(levelname)s",
+        defaults={"shared": "sensitive-default"},
+        field_conflict_strategy=FieldConflictStrategy.ERROR,
+    )
+    env.set_formatter(formatter)
+
+    with pytest.raises(FieldConflictError) as error:
+        formatter.format(make_record({"shared": "sensitive-message"}))
+
+    message = str(error.value)
+    assert "shared" in message
+    assert "defaults" in message
+    assert "message" in message
+    assert "sensitive-default" not in message
+    assert "sensitive-message" not in message
 
 
 @pytest.mark.parametrize("class_", ALL_FORMATTERS)

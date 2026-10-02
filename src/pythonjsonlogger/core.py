@@ -7,16 +7,18 @@ from __future__ import annotations
 
 ## Standard Library
 from datetime import datetime, timezone
+from enum import Enum
 import logging
 import re
 import string
 import sys
-from typing import TypeAlias, Any
-from collections.abc import Container, Sequence
+from typing import TypeAlias, Any, NamedTuple
+from collections.abc import Container, Mapping, Sequence
 
 ## Installed
 
 ## Application
+from .exception import FieldConflictError
 
 
 ### CONSTANTS
@@ -74,6 +76,44 @@ LogData: TypeAlias = dict[str, Any]
 
 *Changed in 4.0*: renamed from `LogRecord` to `LogData`
 """
+
+FIELD_SOURCE_DEFAULTS = "defaults"
+FIELD_SOURCE_REQUIRED_FIELDS = "required_fields"
+FIELD_SOURCE_STATIC_FIELDS = "static_fields"
+FIELD_SOURCE_MESSAGE = "message"
+FIELD_SOURCE_EXTRA = "extra"
+FIELD_SOURCE_TIMESTAMP = "timestamp"
+
+FIELD_SOURCES: tuple[str, ...] = (
+    FIELD_SOURCE_DEFAULTS,
+    FIELD_SOURCE_REQUIRED_FIELDS,
+    FIELD_SOURCE_STATIC_FIELDS,
+    FIELD_SOURCE_MESSAGE,
+    FIELD_SOURCE_EXTRA,
+    FIELD_SOURCE_TIMESTAMP,
+)
+"""Sources considered when assembling output fields, from lowest to highest override."""
+
+FIELD_SOURCES_KEY = "__python_json_logger__.field_sources"
+"""Top-level key used for optional structured field source information."""
+
+FIELD_VALUES_KEY = "__python_json_logger__.values"
+"""Key used alongside sources when retaining values from all field sources."""
+
+
+class FieldConflictStrategy(str, Enum):
+    """Strategies used when more than one source provides an output field."""
+
+    OVERRIDE = "override"
+    PRIORITY = "priority"
+    KEEP_ALL = "keep_all"
+    ERROR = "error"
+
+
+class _FieldCandidate(NamedTuple):
+    source: str
+    original_field: Any
+    value: Any
 
 
 ### FUNCTIONS
@@ -134,6 +174,11 @@ class BaseJsonFormatter(logging.Formatter):
         reserved_attrs: Sequence[str] | None = None,
         timestamp: bool | str = False,
         defaults: dict[str, Any] | None = None,
+        field_conflict_strategy: FieldConflictStrategy | str = FieldConflictStrategy.OVERRIDE,
+        field_conflict_strategies: Mapping[str, FieldConflictStrategy | str] | None = None,
+        field_source_priority: Sequence[str] | None = None,
+        include_field_sources: bool = False,
+        compact_field_sources: bool = False,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
     ) -> None:
@@ -158,6 +203,19 @@ class BaseJsonFormatter(logging.Formatter):
                 outputting the json log record. If string is passed, timestamp will be added
                 to log record using string as key. If True boolean is passed, timestamp key
                 will be "timestamp". Defaults to False/off.
+            field_conflict_strategy: strategy for fields supplied by more than one source.
+                `override` keeps the current order-based behaviour, `priority` uses
+                `field_source_priority`, `keep_all` retains every source value, and `error`
+                raises `FieldConflictError`.
+            field_conflict_strategies: per-output-field overrides for
+                `field_conflict_strategy`.
+            field_source_priority: source names in priority order, from highest to lowest.
+                Defaults to timestamp, extra, message, static fields, required fields and
+                defaults.
+            include_field_sources: add a non-user-colliding structure describing selected or
+                retained field sources.
+            compact_field_sources: when field sources are included, use source names and a
+                separate values list instead of full source descriptors.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
 
@@ -230,6 +288,14 @@ class BaseJsonFormatter(logging.Formatter):
         self._skip_fields = set(self._required_fields)
         self._skip_fields.update(self.reserved_attrs)
         self.defaults = defaults if defaults is not None else {}
+        self.field_conflict_strategy = self._coerce_conflict_strategy(field_conflict_strategy)
+        self.field_conflict_strategies = {
+            key: self._coerce_conflict_strategy(strategy)
+            for key, strategy in (field_conflict_strategies or {}).items()
+        }
+        self.field_source_priority = self._validate_field_source_priority(field_source_priority)
+        self.include_field_sources = include_field_sources
+        self.compact_field_sources = compact_field_sources
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
         return
@@ -356,34 +422,170 @@ class BaseJsonFormatter(logging.Formatter):
 
         *Changed in 4.0*: `log_record` renamed to `log_data`
         """
-        for field in self.defaults:
-            log_data[self._get_rename(field)] = self.defaults[field]
+        candidates_by_field: dict[Any, list[_FieldCandidate]] = {}
+        field_order: list[Any] = []
+        priority_order = {
+            source: index for index, source in enumerate(self.field_source_priority)
+        }
+        canonical_order = {source: index for index, source in enumerate(FIELD_SOURCES)}
+
+        def add_candidate(source: str, original_field: Any, value: Any) -> None:
+            output_field = self.rename_fields.get(original_field, original_field)
+            if output_field not in candidates_by_field:
+                candidates_by_field[output_field] = []
+                field_order.append(output_field)
+            candidates_by_field[output_field].append(
+                _FieldCandidate(
+                    source=source,
+                    original_field=original_field,
+                    value=value,
+                )
+            )
+
+        for field, value in self.defaults.items():
+            add_candidate(FIELD_SOURCE_DEFAULTS, field, value)
 
         for field in self._required_fields:
-            log_data[self._get_rename(field)] = record.__dict__.get(field)
+            add_candidate(FIELD_SOURCE_REQUIRED_FIELDS, field, record.__dict__.get(field))
 
-        for data_dict in [self.static_fields, message_dict]:
-            for key, value in data_dict.items():
-                log_data[self._get_rename(key)] = value
+        for field, value in self.static_fields.items():
+            add_candidate(FIELD_SOURCE_STATIC_FIELDS, field, value)
 
-        merge_record_extra(
-            record,
-            log_data,
-            reserved=self._skip_fields,
-            rename_fields=self.rename_fields,
-        )
+        for field, value in message_dict.items():
+            add_candidate(FIELD_SOURCE_MESSAGE, field, value)
+
+        for field, value in record.__dict__.items():
+            if field not in self._skip_fields and not (
+                hasattr(field, "startswith") and field.startswith("_")
+            ):
+                add_candidate(FIELD_SOURCE_EXTRA, field, value)
 
         if self.timestamp:
-            key = self.timestamp if isinstance(self.timestamp, str) else "timestamp"
-            log_data[self._get_rename(key)] = datetime.fromtimestamp(
-                record.created, tz=timezone.utc
+            field = self.timestamp if isinstance(self.timestamp, str) else "timestamp"
+            add_candidate(
+                FIELD_SOURCE_TIMESTAMP,
+                field,
+                datetime.fromtimestamp(record.created, tz=timezone.utc),
             )
+
+        conflicts: list[str] = []
+        field_source_info: dict[Any, Any] = {}
+
+        for output_field in field_order:
+            strategy = self._get_conflict_strategy(output_field)
+            order = (
+                canonical_order
+                if strategy == FieldConflictStrategy.OVERRIDE
+                else priority_order
+            )
+            candidates = self._sort_field_candidates(
+                candidates_by_field[output_field], order
+            )
+            sources = [candidate.source for candidate in candidates]
+            has_same_source_conflict = len(set(sources)) != len(sources)
+
+            if strategy == FieldConflictStrategy.ERROR and len(candidates) > 1:
+                conflicts.append(self._format_field_conflict(output_field, sources))
+                continue
+
+            if (
+                strategy == FieldConflictStrategy.PRIORITY
+                and has_same_source_conflict
+            ):
+                conflicts.append(self._format_field_conflict(output_field, sources))
+                continue
+
+            if strategy == FieldConflictStrategy.KEEP_ALL and len(candidates) > 1:
+                log_data[output_field] = self._build_field_candidates(candidates)
+            else:
+                if strategy == FieldConflictStrategy.PRIORITY:
+                    selected = candidates[0]
+                else:
+                    selected = candidates[-1]
+                log_data[output_field] = selected.value
+                if self.include_field_sources:
+                    field_source_info[output_field] = self._build_source_info(
+                        [selected], compact=self.compact_field_sources
+                    )
+
+        if conflicts:
+            conflicts.sort()
+            raise FieldConflictError("; ".join(conflicts))
+
+        if self.include_field_sources:
+            log_data[FIELD_SOURCES_KEY] = field_source_info
 
         if self.rename_fields_keep_missing:
             for field in self.rename_fields.values():
                 if field not in log_data:
                     log_data[field] = None
         return
+
+    @staticmethod
+    def _field_sort_key(field: Any) -> tuple[str, Any]:
+        if isinstance(field, (str, int, float, bool)):
+            return type(field).__name__, field
+        return type(field).__name__, repr(field)
+
+    def _sort_field_candidates(
+        self,
+        candidates: list[_FieldCandidate],
+        priority_order: Mapping[str, int],
+    ) -> list[_FieldCandidate]:
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                priority_order[candidate.source],
+                self._field_sort_key(candidate.original_field),
+            ),
+        )
+
+    @staticmethod
+    def _format_field_conflict(field: Any, sources: Sequence[str]) -> str:
+        unique_sources = sorted(set(sources))
+        return f"Conflicting sources for field {field!r}: {', '.join(unique_sources)}"
+
+    def _build_source_info(
+        self, candidates: Sequence[_FieldCandidate], compact: bool
+    ) -> Any:
+        if compact:
+            return [candidate.source for candidate in candidates]
+        return [
+            {"source": candidate.source, "field": candidate.original_field}
+            for candidate in candidates
+        ]
+
+    def _build_field_candidates(self, candidates: Sequence[_FieldCandidate]) -> dict[str, Any]:
+        return {
+            FIELD_SOURCES_KEY: self._build_source_info(
+                candidates, compact=self.compact_field_sources
+            ),
+            FIELD_VALUES_KEY: [candidate.value for candidate in candidates],
+        }
+
+    @staticmethod
+    def _coerce_conflict_strategy(strategy: FieldConflictStrategy | str) -> FieldConflictStrategy:
+        try:
+            return FieldConflictStrategy(strategy)
+        except ValueError:
+            allowed = ", ".join(str(item.value) for item in FieldConflictStrategy)
+            raise ValueError(f"Field conflict strategy must be one of: {allowed}") from None
+
+    @staticmethod
+    def _validate_field_source_priority(
+        priority: Sequence[str] | None,
+    ) -> tuple[str, ...]:
+        if priority is None:
+            return tuple(reversed(FIELD_SOURCES))
+
+        values = tuple(priority)
+        if sorted(values) != sorted(FIELD_SOURCES) or len(set(values)) != len(values):
+            allowed = ", ".join(FIELD_SOURCES)
+            raise ValueError(f"Field source priority must contain each source once: {allowed}")
+        return values
+
+    def _get_conflict_strategy(self, field: Any) -> FieldConflictStrategy:
+        return self.field_conflict_strategies.get(str(field), self.field_conflict_strategy)
 
     def _get_rename(self, key: str) -> str:
         return self.rename_fields.get(key, key)

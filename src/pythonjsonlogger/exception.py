@@ -16,6 +16,10 @@ class PythonJsonLoggerError(Exception):
     "Generic base clas for all Python JSON Logger exceptions"
 
 
+class FieldConflictError(PythonJsonLoggerError, ValueError):
+    "Multiple field sources attempted to populate the same output field"
+
+
 class MissingPackageError(ImportError, PythonJsonLoggerError):
     "A required package is missing"
 
