@@ -158,6 +158,31 @@ formatter = JsonFormatter(json_default=my_default)
 !!! note
     When providing your own `json_default`, you likely want to call the original `json_default` for your encoder. Python JSON Logger provides custom default serializers for each encoder that tries very hard to ensure sane output is always logged.
 
+### Explicit type adapters
+
+For applications with several domain types, a `TypeAdapterRegistry` keeps type handling explicit instead of accumulating `isinstance` checks in one `json_default` function.
+
+```python
+from pythonjsonlogger import AdapterLocation, TypeAdapterRegistry
+from pythonjsonlogger.json import JsonFormatter
+
+
+def adapt_money(money, position):
+    if position.location is AdapterLocation.KEY:
+        return f"money:{money.amount}:{money.currency}"
+    return {"amount": money.amount, "currency": money.currency}
+
+
+registry = TypeAdapterRegistry()
+registry.register(Money, adapt_money)
+
+formatter = JsonFormatter(type_adapters=registry)
+```
+
+Registry adapters run before `json_default`. Exact types take precedence, followed by the most specific registered base class. When multiple unrelated registered base classes could handle an object, the registry raises a `TypeError` instead of depending on registration order.
+
+Each formatter call takes a stable snapshot of the registry. Adapter results are recursively processed, and adapters must not return the original object or a structure containing it in a cycle.
+
 ### Alternate JSON Encoders
 
 The following JSON encoders are also supported:

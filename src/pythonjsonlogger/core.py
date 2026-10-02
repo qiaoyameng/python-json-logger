@@ -18,6 +18,8 @@ from collections.abc import Container, Sequence
 
 ## Application
 
+from .adapters import TypeAdapterRegistry
+
 
 ### CONSTANTS
 ### ============================================================================
@@ -136,6 +138,7 @@ class BaseJsonFormatter(logging.Formatter):
         defaults: dict[str, Any] | None = None,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
+        type_adapters: TypeAdapterRegistry | None = None,
     ) -> None:
         """
         Args:
@@ -160,6 +163,7 @@ class BaseJsonFormatter(logging.Formatter):
                 will be "timestamp". Defaults to False/off.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
+            type_adapters: an optional explicit type adapter registry used before serialization.
 
         *Changed in 3.1*:
 
@@ -232,6 +236,7 @@ class BaseJsonFormatter(logging.Formatter):
         self.defaults = defaults if defaults is not None else {}
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
+        self.type_adapters = type_adapters
         return
 
     def format(self, record: logging.LogRecord) -> str:
@@ -336,6 +341,8 @@ class BaseJsonFormatter(logging.Formatter):
 
         *Changed in 4.0*: `log_record` renamed to `log_data`
         """
+        if self.type_adapters is not None:
+            log_data = self.type_adapters.snapshot().convert(log_data)
         return self.prefix + self.jsonify_log_record(log_data)
 
     def add_fields(

@@ -10,6 +10,7 @@ import warnings
 ## Application
 from . import json
 from . import utils
+from .adapters import AdapterLocation, AdapterPosition, TypeAdapterRegistry
 
 ### CONSTANTS
 ### ============================================================================

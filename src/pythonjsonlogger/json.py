@@ -84,6 +84,8 @@ class JsonFormatter(core.BaseJsonFormatter):
                 that will be used to serialize the log record.
             json_indent: indent parameter for the `json_serializer`
             json_ensure_ascii: `ensure_ascii` parameter for the `json_serializer`
+            type_adapters: an optional explicit type adapter registry used before
+                `json_default` and the JSON encoder.
             kwargs: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
         """
         super().__init__(*args, **kwargs)

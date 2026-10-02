@@ -55,6 +55,8 @@ class OrjsonFormatter(core.BaseJsonFormatter):
             args: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
             json_default: a function for encoding non-standard objects
             json_indent: indent output with 2 spaces.
+            type_adapters: an optional explicit type adapter registry used before
+                `json_default`.
             kwargs: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
         """
         super().__init__(*args, **kwargs)

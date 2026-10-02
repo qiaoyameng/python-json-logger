@@ -51,6 +51,8 @@ class MsgspecFormatter(core.BaseJsonFormatter):
         Args:
             args: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
             json_default: a function for encoding non-standard objects
+            type_adapters: an optional explicit type adapter registry used before
+                `json_default`.
             kwargs: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
         """
         super().__init__(*args, **kwargs)

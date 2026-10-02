@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `TypeAdapterRegistry` for explicit, position-aware type adapters. Registry adapters take precedence over `json_default`, use exact types before inherited types, report ambiguous multiple-inheritance matches, recursively process adapter results, detect self-returning or cyclic adapters, and use a stable snapshot per formatted record.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 
