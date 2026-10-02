@@ -78,7 +78,9 @@ class JsonFormatter(core.BaseJsonFormatter):
         """
         Args:
             args: see [BaseJsonFormatter][pythonjsonlogger.core.BaseJsonFormatter]
-            json_default: a function for encoding non-standard objects
+            json_default: a function for encoding non-standard objects. If
+                `type_adapters` is also given, types registered there are converted
+                by the registry first and this function only handles the rest.
             json_encoder: custom JSON encoder
             json_serializer: a [`json.dumps`](https://docs.python.org/3/library/json.html#json.dumps)-compatible callable
                 that will be used to serialize the log record.

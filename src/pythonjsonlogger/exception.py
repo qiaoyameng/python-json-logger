@@ -2,6 +2,7 @@
 ### ============================================================================
 ## Future
 from __future__ import annotations
+from __future__ import annotations
 
 ## Standard Library
 
@@ -25,3 +26,25 @@ class MissingPackageError(ImportError, PythonJsonLoggerError):
             msg += f" It can be installed using 'python-json-logger[{extras_name}]'."
         super().__init__(msg)
         return
+
+
+class AdapterError(PythonJsonLoggerError):
+    "Base class for type adapter registry errors"
+
+
+class AmbiguousAdapterError(AdapterError):
+    "No single most specific adapter exists for a type"
+
+    def __init__(self, cls: type, candidates: list[type]) -> None:
+        self.cls = cls
+        self.candidates = tuple(candidates)
+        names = ", ".join(candidate.__qualname__ for candidate in candidates)
+        super().__init__(
+            f"Multiple adapters could apply to {cls.__qualname__!r} with no most"
+            f" specific candidate: {names}"
+        )
+        return
+
+
+class AdapterCycleError(AdapterError):
+    "An adapter returned the object it was given or a conversion cycle was detected"

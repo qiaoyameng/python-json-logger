@@ -12,11 +12,12 @@ import re
 import string
 import sys
 from typing import TypeAlias, Any
-from collections.abc import Container, Sequence
+from collections.abc import Container, Mapping, Sequence
 
 ## Installed
 
 ## Application
+from .adapters import TypeAdapter, TypeAdapterRegistry, convert_with_adapters
 
 
 ### CONSTANTS
@@ -136,6 +137,7 @@ class BaseJsonFormatter(logging.Formatter):
         defaults: dict[str, Any] | None = None,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
+        type_adapters: TypeAdapterRegistry | Mapping[type, TypeAdapter] | None = None,
     ) -> None:
         """
         Args:
@@ -160,6 +162,13 @@ class BaseJsonFormatter(logging.Formatter):
                 will be "timestamp". Defaults to False/off.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
+            type_adapters: an optional
+                [TypeAdapterRegistry][pythonjsonlogger.adapters.TypeAdapterRegistry]
+                (or mapping of types to adapter callables) used to convert custom
+                objects into JSON compatible values before serialization. Registered
+                types take precedence over `json_default`, which remains the fallback
+                for unregistered types. The registry is snapshotted once per `format`
+                call so concurrent updates never affect an in-flight log record.
 
         *Changed in 3.1*:
 
@@ -232,6 +241,10 @@ class BaseJsonFormatter(logging.Formatter):
         self.defaults = defaults if defaults is not None else {}
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
+        if type_adapters is None or isinstance(type_adapters, TypeAdapterRegistry):
+            self.type_adapters = type_adapters
+        else:
+            self.type_adapters = TypeAdapterRegistry(type_adapters)
         return
 
     def format(self, record: logging.LogRecord) -> str:
@@ -274,6 +287,11 @@ class BaseJsonFormatter(logging.Formatter):
         log_data: LogData = {}
         self.add_fields(log_data, record, message_dict)
         log_data = self.process_log_record(log_data)
+
+        if self.type_adapters is not None:
+            # Snapshot so the whole record is converted with one stable set of
+            # rules even if another thread updates the registry mid-format.
+            log_data = convert_with_adapters(log_data, self.type_adapters.snapshot())
 
         return self.serialize_log_record(log_data)
 
