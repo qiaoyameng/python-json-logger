@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `max_bytes` and related arguments (`max_bytes_required_fields`, `max_bytes_field_priority`, `max_bytes_report_field`) on `BaseJsonFormatter`. Records whose serialized UTF-8 output exceeds the budget are trimmed by truncating or dropping non-required fields (with explicit truncation markers and a trimming report), raising `MaxBytesExceededError` when even the minimal record cannot fit.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 
